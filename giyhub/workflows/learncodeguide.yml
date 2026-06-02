@@ -1,0 +1,232 @@
+name: LearnCodeGuide Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    env:
+      LCG_API_KEY: ${{ secrets.LCG_API_KEY }}
+    steps:
+      - name: Check API key
+        id: precheck
+        shell: bash
+        run: |
+          if [ -z "$LCG_API_KEY" ]; then
+            echo "::warning::LCG_API_KEY secret is not configured — skipping LearnCodeGuide review."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Analyze changed files
+        if: steps.precheck.outputs.skip != 'true'
+        uses: actions/github-script@v7
+        env:
+          LCG_API_KEY: ${{ secrets.LCG_API_KEY }}
+        with:
+          script: |
+            const LANG_MAP = {
+              '.js':   'javascript',
+              '.ts':   'typescript',
+              '.py':   'python',
+              '.java': 'java',
+              '.cs':   'csharp',
+              '.cpp':  'cpp',
+            };
+            const API_URL = 'https://learncodeguide-app-production.up.railway.app/api/github/analyze';
+            const COMMENT_MARKER = '<!-- learncodeguide-review -->';
+            const MAX_BODY = 60000;
+
+            const { owner, repo } = context.repo;
+            const pr = context.payload.pull_request;
+            if (!pr) {
+              core.setFailed('No pull_request payload found.');
+              return;
+            }
+            const prNumber = pr.number;
+            const headSha  = pr.head.sha;
+
+            const extOf = (name) => {
+              const i = name.lastIndexOf('.');
+              return i >= 0 ? name.slice(i).toLowerCase() : '';
+            };
+
+            // 1) List PR files
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner, repo, pull_number: prNumber, per_page: 100,
+            });
+
+            const targets = files.filter(f => {
+              if (f.status === 'removed') return false;
+              return LANG_MAP[extOf(f.filename)] != null;
+            });
+
+            if (targets.length === 0) {
+              core.info('No files with supported extensions changed — nothing to analyze.');
+              return;
+            }
+            core.info(`Analyzing ${targets.length} file(s).`);
+
+            // 2) Fetch content + POST to LCG for each file
+            const perFile = [];
+            for (const f of targets) {
+              const language = LANG_MAP[extOf(f.filename)];
+              let code = null;
+              try {
+                const res = await github.rest.repos.getContent({
+                  owner, repo, path: f.filename, ref: headSha,
+                });
+                if (Array.isArray(res.data) || res.data.type !== 'file' || !res.data.content) {
+                  core.warning(`Skipping ${f.filename}: not a readable file (size too large or non-file).`);
+                  perFile.push({ filename: f.filename, language, error: 'content unavailable' });
+                  continue;
+                }
+                code = Buffer.from(res.data.content, res.data.encoding || 'base64').toString('utf8');
+              } catch (err) {
+                core.warning(`Failed to read ${f.filename}: ${err.message}`);
+                perFile.push({ filename: f.filename, language, error: `read failed: ${err.message}` });
+                continue;
+              }
+
+              try {
+                const resp = await fetch(API_URL, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${process.env.LCG_API_KEY}`,
+                  },
+                  body: JSON.stringify({ code, language, mode: 'all', doubleCheck: true }),
+                });
+                if (!resp.ok) {
+                  const text = await resp.text();
+                  core.warning(`LCG ${resp.status} for ${f.filename}: ${text.slice(0, 300)}`);
+                  perFile.push({ filename: f.filename, language, error: `HTTP ${resp.status}` });
+                  continue;
+                }
+                const data = await resp.json();
+                if (!data || data.ok !== true) {
+                  core.warning(`LCG ok=false for ${f.filename}: ${data && data.error || 'unknown'}`);
+                  perFile.push({ filename: f.filename, language, error: (data && data.error) || 'unknown' });
+                  continue;
+                }
+                perFile.push({ filename: f.filename, language, output: data.output || {} });
+              } catch (err) {
+                core.warning(`Network error analyzing ${f.filename}: ${err.message}`);
+                perFile.push({ filename: f.filename, language, error: err.message });
+              }
+            }
+
+            // 3) Aggregate
+            const scores = perFile
+              .map(r => r.output && typeof r.output.healthScore === 'number' ? r.output.healthScore : null)
+              .filter(v => v !== null);
+            const overall = scores.length
+              ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length)
+              : null;
+
+            const allIssues = [];
+            for (const r of perFile) {
+              const issues = (r.output && (r.output.issues || r.output.findings)) || [];
+              for (const it of issues) allIssues.push({ ...it, _file: r.filename });
+            }
+            const isCritical = (it) => String(it.severity || '').toUpperCase() === 'CRITICAL';
+            const criticalCount = allIssues.filter(isCritical).length;
+            const verdict = criticalCount > 0 ? 'FAIL ❌' : 'PASS ✅';
+
+            // 4) Executive summary — prefer API-provided, otherwise derive 3 bullets
+            let execBullets = [];
+            for (const r of perFile) {
+              const s = r.output && r.output.executiveSummary;
+              if (Array.isArray(s) && s.length) { execBullets = s.slice(0, 3); break; }
+            }
+            if (execBullets.length === 0) {
+              execBullets.push(
+                overall !== null
+                  ? `Overall health score across ${perFile.length} file(s): ${overall}/100.`
+                  : `Reviewed ${perFile.length} file(s).`
+              );
+              execBullets.push(`Total findings: ${allIssues.length} (${criticalCount} critical).`);
+              execBullets.push(
+                criticalCount > 0
+                  ? 'Critical issues require attention before merge.'
+                  : 'No blocking issues detected — safe to review.'
+              );
+            }
+
+            // 5) Build comment
+            const sevIcon = (s) => {
+              const v = String(s || '').toUpperCase();
+              if (v === 'CRITICAL') return '🔴';
+              if (v === 'HIGH')     return '🟠';
+              if (v === 'MEDIUM')   return '🟡';
+              if (v === 'LOW')      return '🟢';
+              return '⚪';
+            };
+            const fence = (lang, body) => '```' + lang + '\n' + String(body) + '\n```';
+
+            let body = `${COMMENT_MARKER}\n## 🤖 LearnCodeGuide Review\n\n`;
+            body += `**Health Score (overall):** ${overall !== null ? overall + '/100' : 'n/a'}\n`;
+            body += `**Verdict:** ${verdict}\n\n`;
+            body += `### Executive Summary\n`;
+            for (const b of execBullets.slice(0, 3)) body += `- ${b}\n`;
+            body += `\n<details><summary><strong>Detailed findings per file</strong></summary>\n\n`;
+
+            for (const r of perFile) {
+              body += `#### \`${r.filename}\` _(${r.language})_\n`;
+              if (r.error) {
+                body += `> ⚠️ Analysis error: ${r.error}\n\n`;
+                continue;
+              }
+              if (r.output && typeof r.output.healthScore === 'number') {
+                body += `Health Score: **${r.output.healthScore}/100**\n\n`;
+              }
+              const issues = (r.output && (r.output.issues || r.output.findings)) || [];
+              if (issues.length === 0) {
+                body += `_No issues found._\n\n`;
+                continue;
+              }
+              for (const it of issues) {
+                const sev = String(it.severity || 'INFO').toUpperCase();
+                const title = it.title || it.message || 'Issue';
+                const where = it.line ? ` (line ${it.line})` : '';
+                body += `- ${sevIcon(sev)} **${sev}**${where} — ${title}\n`;
+                if (it.description) body += `  ${it.description}\n`;
+                const fix = it.fix || it.suggestion;
+                if (fix) {
+                  body += `\n  <details><summary>Suggested fix</summary>\n\n`;
+                  body += fence(r.language, fix).split('\n').map(l => '  ' + l).join('\n') + '\n\n';
+                  body += `  </details>\n`;
+                }
+              }
+              body += `\n`;
+            }
+            body += `</details>\n\n---\n_Powered by [LearnCodeGuide](https://learncodeguide.com)_\n`;
+
+            if (body.length > MAX_BODY) {
+              body = body.slice(0, MAX_BODY) + '\n\n_…comment truncated to fit GitHub size limit._\n';
+            }
+
+            // 6) Upsert single PR comment (marker-based)
+            const existing = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: prNumber, per_page: 100,
+            });
+            const prev = existing.find(c => typeof c.body === 'string' && c.body.includes(COMMENT_MARKER));
+            if (prev) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: prev.id, body });
+              core.info(`Updated existing review comment #${prev.id}.`);
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
+              core.info('Posted new review comment.');
+            }
+
+            // 7) Fail job if any CRITICAL issue
+            if (criticalCount > 0) {
+              core.setFailed(`LearnCodeGuide found ${criticalCount} CRITICAL issue(s).`);
+            }
